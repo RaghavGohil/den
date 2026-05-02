@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/41d23938-ec73-4342-aafc-3caddc7b87f7" width="200" alt="den logo" />
+  <img src="https://github.com/user-attachments/assets/2fcad7f5-97dc-400c-b902-11ffc9d68215" width="200" alt="den logo" />
 </p>
 
 <p align="center">
