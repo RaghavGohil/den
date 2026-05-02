@@ -1,17 +1,25 @@
 """
-Interactive TUI for den using curses.
-Supports normal and vim keybinding modes.
+Interactive TUI for den using textual.
+Supports Operate, Search, Visual, View, and Add modes.
 """
 
+import argparse
 import os
 import sys
-import curses
 import tempfile
-import argparse
 import subprocess
 
-from . import note, project
+from textual.app import App, ComposeResult, InvalidThemeError
+from textual.widgets import ListView, ListItem, Static, Input, Label
+from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.binding import Binding
+from textual.screen import Screen
+from textual import on
+from textual.message import Message
+from textual.reactive import reactive
 
+from ..config import THEME
+from . import note, project
 from ..parser.notes_helper import (
     load_notes,
     get_reference,
@@ -22,539 +30,540 @@ from ..parser.notes_helper import (
 )
 
 
-# --- Modes ---
-MODE_OPERATE = "OPERATE"
-MODE_SEARCH = "SEARCH"
-MODE_VIEW = "VIEW"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-class TUI:
-    def __init__(self, project_uid: str):
-        self.project_uid = project_uid
-        self.mode = MODE_OPERATE
-        self.cursor = 0
-        self.scroll_offset = 0
-        self.search_query = ""
-        self.notes: list = []
-        self.filtered_indices: list = []
-        self.status_msg = ""
-        self.ref_scroll_offset = 0
-        self._reload_notes()
+def _get_note_items(notes_list: "NoteListView") -> list["NoteItem"]:
+    """Return a plain list of NoteItem children — safe to index."""
+    return [c for c in notes_list.children if isinstance(c, NoteItem)]
 
-    def _reload_notes(self):
-        raw = load_notes(self.project_uid)
-        # Reverse so newest is first
-        self.notes = list(reversed(raw))
-        self.filtered_indices = list(range(len(self.notes)))
-        # Clamp cursor
-        if self.cursor >= len(self.filtered_indices):
-            self.cursor = max(0, len(self.filtered_indices) - 1)
 
-    def _visible_notes(self) -> list:
-        """Returns list of (original_index, note) tuples for current view."""
-        return [(i, self.notes[i]) for i in self.filtered_indices]
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
 
-    def run(self, stdscr):
-        curses.set_escdelay(25)
-        curses.curs_set(0)
-        curses.use_default_colors()
 
-        curses.init_pair(1, curses.COLOR_CYAN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.init_pair(4, curses.COLOR_GREEN, -1)
-        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
+class NoteItem(ListItem):
+    """A single row in the note list."""
 
-        stdscr.timeout(50)
+    is_selected = reactive(False)
 
-        while True:
-            self._draw(stdscr)
-            key = stdscr.getch()
-            if key == -1:
-                continue
-            action = self._handle_input(key)
-            if action == "QUIT":
-                break
+    def __init__(self, note_data: dict, orig_idx: int):
+        super().__init__()
+        self.note_data = note_data
+        self.orig_idx = orig_idx
 
-    # ─────────────────────────────────────────
-    #  DRAW
-    # ─────────────────────────────────────────
-    def _draw(self, stdscr):
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
+    def compose(self) -> ComposeResult:
+        content = self.note_data.get("content", "") or ""
+        uid = self.note_data.get("id", "")
+        timestamp = _format_timestamp(self.note_data.get("created_at", ""))
+        ref = get_reference(self.note_data)
+        display_id = self.orig_idx + 1
 
-        if self.mode == MODE_VIEW:
-            self._draw_view(stdscr, h, w)
-        else:
-            self._draw_list(stdscr, h, w)
-
-        stdscr.refresh()
-
-    def _draw_list(self, stdscr, h, w):
-        visible = self._visible_notes()
-        total_notes = len(self.notes)
-
-        # --- Header ---
-        header = f"  den · {total_notes} note{'s' if total_notes != 1 else ''}"
-        mode_label = f"[{self.mode}]"
-        header_line = header.ljust(w - len(mode_label) - 1) + mode_label
-
-        try:
-            stdscr.addnstr(
-                0, 0, header_line, w - 1, curses.A_BOLD | curses.color_pair(1)
-            )
-            stdscr.addnstr(1, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-        # --- Context preview panel ---
-        sel = self._get_selected()
-        ref = get_reference(sel[2]) if sel else None
-
-        ctx_lines_count = 0
-        ctx_display_lines = []
-        if ref:
-            filepath = ref.get("filepath", "")
-            start = ref.get("start_line", "")
-            end = ref.get("end_line", "")
-            code = read_reference_code(ref)
-            ref_label = f"{filepath}:{start}-{end}"
-            ctx_display_lines.append((f"  {ref_label}", curses.color_pair(2)))
-            if code:
-                code_lines = code.splitlines()
-                max_ctx = 6
-                for cl in code_lines[:max_ctx]:
-                    ctx_display_lines.append((f"    {cl}", curses.A_DIM))
-                if len(code_lines) > max_ctx:
-                    ctx_display_lines.append(
-                        (
-                            f"    ... {len(code_lines) - max_ctx} more lines",
-                            curses.A_DIM,
-                        )
-                    )
-            ctx_lines_count = len(ctx_display_lines) + 1
-
-        list_height = h - 4 - ctx_lines_count
-        if list_height < 1:
-            list_height = 1
-
-        # Scrolling
-        if self.cursor < self.scroll_offset:
-            self.scroll_offset = self.cursor
-        if self.cursor >= self.scroll_offset + list_height:
-            self.scroll_offset = self.cursor - list_height + 1
-
-        if not visible and self.search_query:
-            try:
-                stdscr.addnstr(2, 0, "  No matches found.", w - 1, curses.A_DIM)
-            except curses.error:
-                pass
-        else:
-            for row_idx in range(list_height):
-                note_idx = self.scroll_offset + row_idx
-                if note_idx >= len(visible):
-                    break
-
-                orig_idx, n = visible[note_idx]
-                display_id = orig_idx + 1
-                content = n.get("content", "") or ""
-                if content:
-                    content = content.splitlines()[0]
-                timestamp = _format_timestamp(n.get("created_at", ""))
-                note_ref = get_reference(n)
-
-                ref_tag = ""
-                if note_ref:
-                    basename = os.path.basename(note_ref.get("filepath", ""))
-                    ref_tag = f" 📎 {basename}"
-
-                idx_str = f"[{display_id}]"
-                # Emoji 📎 takes 2 columns, len() is 1. Add 1 for extra column.
-                ref_visual_len = len(ref_tag) + (1 if ref_tag else 0)
-                ts_len = len(timestamp) + ref_visual_len + 4
-                content_width = max(5, w - len(idx_str) - ts_len - 6)
-
-                if len(content) > content_width:
-                    content = content[: content_width - 2] + ".."
-
-                is_selected = note_idx == self.cursor
-                cursor_char = ">" if is_selected else " "
-
-                line = f" {cursor_char} {idx_str}  {content.ljust(content_width)}{ref_tag}  {timestamp}"
-
-                y = row_idx + 2
-                try:
-                    if is_selected:
-                        stdscr.addnstr(
-                            y, 0, line.ljust(w - 1), w - 1, curses.color_pair(5)
-                        )
-                    else:
-                        stdscr.addnstr(y, 0, " " * (w - 1), w - 1)
-                        x = 0
-                        prefix = f" {cursor_char} {idx_str}  "
-                        stdscr.addnstr(y, x, prefix, w - 1, curses.A_DIM)
-                        x += len(prefix)
-                        stdscr.addnstr(y, x, content.ljust(content_width), w - 1 - x)
-                        x += content_width
-                        if ref_tag:
-                            stdscr.addnstr(
-                                y, x, ref_tag, w - 1 - x, curses.color_pair(2)
-                            )
-                            x += ref_visual_len
-                        stdscr.addnstr(y, x, f"  {timestamp}", w - 1 - x, curses.A_DIM)
-                except curses.error:
-                    pass
-
-        # --- Context panel ---
-        if ctx_display_lines:
-            ctx_start_y = 2 + list_height
-            try:
-                stdscr.addnstr(ctx_start_y, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-                for ci, item in enumerate(ctx_display_lines):
-                    line_text, attr = item
-                    y = ctx_start_y + 1 + ci
-                    if y >= h - 2:
-                        break
-                    stdscr.addnstr(y, 0, line_text[: w - 1], w - 1, attr)
-            except curses.error:
-                pass
-
-        # --- Separator + Footer ---
-        try:
-            stdscr.addnstr(h - 2, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-        footer_y = h - 1
-        try:
-            if self.mode == MODE_SEARCH:
-                search_line = f"  /: {self.search_query}█"
-                stdscr.addnstr(footer_y, 0, search_line, w - 1, curses.color_pair(1))
-            elif self.status_msg:
-                stdscr.addnstr(
-                    footer_y, 0, f"  {self.status_msg}", w - 1, curses.color_pair(4)
-                )
-                self.status_msg = ""
-            elif self.search_query:
-                search_line = f"  /: {self.search_query} "
-                stdscr.addnstr(footer_y, 0, search_line, w - 1, curses.color_pair(1))
-                hints = " (esc:clear)"
-                stdscr.addnstr(
-                    footer_y,
-                    len(search_line),
-                    hints,
-                    w - 1 - len(search_line),
-                    curses.A_DIM,
-                )
-            elif self.mode == MODE_VIEW:
-                hints = "  j/k:move  q/esc:back"
-                stdscr.addnstr(footer_y, 0, hints, w - 1, curses.A_DIM)
-            else:
-                hints = "  j/k:move  /:search  enter:view  e:edit  d:del  q/esc:quit"
-                stdscr.addnstr(footer_y, 0, hints, w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-    def _draw_view(self, stdscr, h, w):
-        sel = self._get_selected()
-        if not sel:
-            self.mode = MODE_OPERATE
-            return
-
-        _, display_id, n = sel
-        content = n.get("content", "") or ""
-        ref = get_reference(n)
-
-        # --- Header ---
-        header = f"  den · note [{display_id}]"
-        mode_label = "[VIEW]"
-        header_line = header.ljust(w - len(mode_label) - 1) + mode_label
-
-        try:
-            stdscr.addnstr(
-                0, 0, header_line, w - 1, curses.A_BOLD | curses.color_pair(1)
-            )
-            stdscr.addnstr(1, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-        # --- Content (sticky, top) ---
-        content_lines = content.splitlines() if content else ["(empty note)"]
-        max_content_lines = min(len(content_lines), max(3, h // 3))
-        for i, cl in enumerate(content_lines[:max_content_lines]):
-            try:
-                stdscr.addnstr(2 + i, 0, f"  {cl}"[: w - 1], w - 1)
-            except curses.error:
-                pass
-        if len(content_lines) > max_content_lines:
-            try:
-                stdscr.addnstr(
-                    2 + max_content_lines,
-                    0,
-                    f"  ... {len(content_lines) - max_content_lines} more lines",
-                    w - 1,
-                    curses.A_DIM,
-                )
-                max_content_lines += 1
-            except curses.error:
-                pass
-
-        # --- Reference separator ---
-        ref_start_y = 2 + max_content_lines + 1
-        try:
-            stdscr.addnstr(ref_start_y - 1, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-        if not ref:
-            try:
-                stdscr.addnstr(ref_start_y, 0, "  No reference.", w - 1, curses.A_DIM)
-            except curses.error:
-                pass
-        else:
-            filepath = ref.get("filepath", "")
-            start = ref.get("start_line", "")
-            end = ref.get("end_line", "")
-            code = read_reference_code(ref)
-
-            title = f"{filepath}:{start}-{end}"
-            try:
-                stdscr.addnstr(ref_start_y, 0, title, w - 1, curses.color_pair(2))
-            except curses.error:
-                pass
-
-            code_lines = code.splitlines() if code else []
-            view_h = h - ref_start_y - 3  # footer(2) + title(1)
-            if view_h < 1:
-                view_h = 1
-
-            for i in range(view_h):
-                ln_idx = self.ref_scroll_offset + i
-                if ln_idx >= len(code_lines):
-                    break
-                try:
-                    stdscr.addnstr(
-                        ref_start_y + 1 + i,
-                        0,
-                        f"    {code_lines[ln_idx]}"[: w - 1],
-                        w - 1,
-                        curses.A_DIM,
-                    )
-                except curses.error:
-                    pass
-
-        # --- Footer ---
-        try:
-            stdscr.addnstr(h - 2, 0, "─" * (w - 1), w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-        footer_y = h - 1
-        try:
-            hints = "  j/k:move  q/esc:back"
-            stdscr.addnstr(footer_y, 0, hints, w - 1, curses.A_DIM)
-        except curses.error:
-            pass
-
-    # ─────────────────────────────────────────
-    #  INPUT
-    # ─────────────────────────────────────────
-    def _handle_input(self, key: int) -> str:
-        if self.mode == MODE_SEARCH:
-            return self._handle_search_input(key)
-        if self.mode == MODE_VIEW:
-            return self._handle_view_input(key)
-        return self._handle_operate_input(key)
-
-    def _handle_operate_input(self, key: int) -> str:
-        if key == ord("q"):
-            return "QUIT"
-        if key == 27:
-            if len(self.filtered_indices) != len(self.notes):
-                self.filtered_indices = list(range(len(self.notes)))
-                self.search_query = ""
-                self.cursor = 0
-                self.scroll_offset = 0
-            else:
-                return "QUIT"
-
-        if key in (ord("k"), curses.KEY_UP):
-            self._move_up()
-        elif key in (ord("j"), curses.KEY_DOWN):
-            self._move_down()
-        elif key == ord("/"):
-            self._enter_search()
-        elif key in (curses.KEY_ENTER, 10, 13):
-            self._enter_view()
-        elif key == ord("e"):
-            self._edit_selected()
-        elif key == ord("d"):
-            self._delete_selected()
-
-        return ""
-
-    def _handle_view_input(self, key: int) -> str:
-        if key in (ord("q"), 27):
-            self.mode = MODE_OPERATE
-            self.ref_scroll_offset = 0
-        elif key in (ord("k"), curses.KEY_UP):
-            if self.ref_scroll_offset > 0:
-                self.ref_scroll_offset -= 1
-        elif key in (ord("j"), curses.KEY_DOWN):
-            sel = self._get_selected()
-            if sel:
-                ref = get_reference(sel[2])
+        with Horizontal(classes="note-item-layout"):
+            yield Label(f"{uid[:8]}", classes="note-uid")
+            yield Label(f"{display_id}", classes="note-id")
+            with Vertical(classes="note-content-container"):
+                yield Label(content, classes="note-content")
                 if ref:
+                    basename = os.path.basename(ref.get("filepath", ""))
+                    yield Label(basename, classes="note-ref")
+            yield Label(timestamp, classes="note-time")
+
+    def watch_is_selected(self, value: bool) -> None:
+        self.set_class(value, "selected")
+
+
+class NoteListView(ListView):
+    """ListView with Vim-style navigation and visual selection."""
+
+    BINDINGS = [
+        Binding("j", "cursor_down", "down", show=False),
+        Binding("k", "cursor_up", "up", show=False),
+        Binding("down", "cursor_down", "down", show=False),
+        Binding("up", "cursor_up", "up", show=False),
+        Binding("v", "toggle_mode", "select", show=False),
+    ]
+
+    class ModeChanged(Message):
+        def __init__(self, select_mode: bool):
+            super().__init__()
+            self.select_mode = select_mode
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.select_mode = False
+        self.selection_start_index: int | None = None
+
+    def action_toggle_mode(self) -> None:
+        self.select_mode = not self.select_mode
+        if self.select_mode:
+            self.selection_start_index = self.index
+            self._update_selection()
+        else:
+            self._clear_selection()
+            self.selection_start_index = None
+        self.post_message(self.ModeChanged(self.select_mode))
+
+    def _clear_selection(self) -> None:
+        for item in self.query(NoteItem):
+            item.is_selected = False
+
+    def _update_selection(self) -> None:
+        if self.selection_start_index is None or self.index is None:
+            return
+        start = min(self.selection_start_index, self.index)
+        end = max(self.selection_start_index, self.index)
+        for i, item in enumerate(_get_note_items(self)):
+            item.is_selected = start <= i <= end
+
+    def action_cursor_down(self) -> None:
+        super().action_cursor_down()
+        if self.select_mode:
+            self._update_selection()
+
+    def action_cursor_up(self) -> None:
+        super().action_cursor_up()
+        if self.select_mode:
+            self._update_selection()
+
+
+class BottomPreview(Static):
+    """
+    Compact single-line strip docked below the list.
+    Shows the first line of content + ref filename if present.
+    Full content is only accessible via FullScreenView (Enter).
+    """
+
+    def update_preview(self, note_data: dict | None) -> None:
+        if not note_data:
+            self.display = False
+            return
+
+        ref = get_reference(note_data)
+        if not ref:
+            self.display = False
+            return
+
+        filepath = ref.get("filepath", "")
+        start = ref.get("start_line", "")
+        end = ref.get("end_line", "")
+        self.display = True
+        self.update(f"[dim]ref:[/dim] {filepath}:{start}-{end}")
+
+
+# ---------------------------------------------------------------------------
+# Full-screen view (Enter)
+# ---------------------------------------------------------------------------
+
+
+class FullScreenView(Screen):
+    """Full-screen read-only view for a single note."""
+
+    BINDINGS = [
+        Binding("q", "app.pop_screen", "back"),
+        Binding("j", "scroll_down", "scroll down", show=False),
+        Binding("k", "scroll_up", "scroll up", show=False),
+        Binding("down", "scroll_down", "scroll down", show=False),
+        Binding("up", "scroll_up", "scroll up", show=False),
+    ]
+
+    def __init__(self, note_data: dict):
+        super().__init__()
+        self.note_data = note_data
+
+    def compose(self) -> ComposeResult:
+        content = self.note_data.get("content", "") or "[dim]No note content.[/dim]"
+        ref = get_reference(self.note_data)
+
+        with Vertical(id="view-container"):
+            with ScrollableContainer(id="view-scroll-area"):
+                yield Label(
+                    f"[overline][b] NOTE [/b][/overline]\n\n{content}",
+                    id="view-header",
+                )
+                if ref:
+                    filepath = ref.get("filepath", "")
+                    start = ref.get("start_line", "")
+                    end = ref.get("end_line", "")
                     code = read_reference_code(ref)
-                    if self.ref_scroll_offset < len(code.splitlines()) - 1:
-                        self.ref_scroll_offset += 1
-        return ""
+                    context_text = (
+                        f"[overline][b] REFERENCE [/b][/overline] "
+                        f"[dim]{filepath}:{start}-{end}[/dim]\n\n{code}"
+                    )
+                else:
+                    context_text = "\n[dim]No reference attached to this note.[/dim]"
+                yield Label(context_text, id="view-context")
+            yield Static(
+                "[b][#fad166]q[/#fad166][/b] back",
+                id="footer",
+            )
 
-    def _handle_search_input(self, key: int) -> str:
-        if key == 27:
-            self.mode = MODE_OPERATE
-            return ""
-        elif key in (curses.KEY_ENTER, 10, 13):
-            self.mode = MODE_OPERATE
-            return ""
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            self.search_query = self.search_query[:-1]
-            self._apply_search()
-        elif 32 <= key <= 126:
-            self.search_query += chr(key)
-            self._apply_search()
-        return ""
+    def action_scroll_down(self) -> None:
+        self.query_one("#view-scroll-area").scroll_relative(y=3)
 
-    # ─────────────────────────────────────────
-    #  ACTIONS
-    # ─────────────────────────────────────────
-    def _enter_search(self):
-        self.mode = MODE_SEARCH
+    def action_scroll_up(self) -> None:
+        self.query_one("#view-scroll-area").scroll_relative(y=-3)
+
+
+# ---------------------------------------------------------------------------
+# Main screen
+# ---------------------------------------------------------------------------
+
+
+class MainScreen(Screen):
+    """Main screen: list + bottom preview strip."""
+
+    select_mode = reactive(False)
+    add_mode = reactive(False)
+
+    BINDINGS = [
+        Binding("q", "quit_system", "quit"),
+        Binding("/", "search", "search"),
+        Binding("j", "cursor_down", "down", show=False),
+        Binding("k", "cursor_up", "up", show=False),
+        Binding("e", "edit_note", "edit"),
+        Binding("d", "delete_notes", "delete"),
+        Binding("v", "toggle_mode", "select"),
+        Binding("a", "enter_add_mode", "add"),
+        Binding("enter", "view_note", "view"),
+        Binding("escape", "cancel", "cancel", show=False),
+    ]
+
+    def __init__(self, project_uid: str):
+        super().__init__()
+        self.project_uid = project_uid
+        self.notes: list[dict] = []
         self.search_query = ""
-        self.filtered_indices = list(range(len(self.notes)))
-        self.cursor = 0
-        self.scroll_offset = 0
 
-    def _apply_search(self):
-        query = self.search_query.lower()
-        if not query:
-            self.filtered_indices = list(range(len(self.notes)))
+    def compose(self) -> ComposeResult:
+        with Vertical(id="main-layout"):
+            yield NoteListView(id="notes-list")
+            yield BottomPreview(id="bottom-preview")
+        yield Input(placeholder="Search...", id="search-input")
+        yield Input(placeholder="Add note...", id="add-input")
+        yield Static("", id="footer")
+
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
+
+    def _update_footer(self) -> None:
+        if self.add_mode:
+            text = "[b][#fad166]esc[/#fad166][/b] cancel  [b][#fad166]enter[/#fad166][/b] add"
+        elif self.select_mode:
+            text = "[b][#fad166]esc[/#fad166][/b] deselect  [b][#fad166]d[/#fad166][/b] delete"
         else:
-            self.filtered_indices = [
-                i
-                for i, n in enumerate(self.notes)
-                if query in (n.get("content", "") or "").lower()
-            ]
-        self.cursor = 0
-        self.scroll_offset = 0
-
-    def _enter_view(self):
-        sel = self._get_selected()
-        if sel:
-            self.mode = MODE_VIEW
-            self.ref_scroll_offset = 0
-
-    def _move_up(self):
-        if self.cursor > 0:
-            self.cursor -= 1
-
-    def _move_down(self):
-        if self.cursor < len(self.filtered_indices) - 1:
-            self.cursor += 1
-
-    def _get_selected(self) -> tuple:
-        """Returns (original_list_index, display_id, note) or None."""
-        visible = self._visible_notes()
-        if not visible or self.cursor >= len(visible):
-            return None
-        orig_idx, n = visible[self.cursor]
-        display_id = orig_idx + 1
-        return orig_idx, display_id, n
-
-    def _edit_selected(self):
-        sel = self._get_selected()
-        if not sel:
-            return
-
-        _, display_id, n = sel
-        editor = os.environ.get("EDITOR", "nano")
-
-        editor_text = format_editor_content(n)
-
-        curses.endwin()
-
+            text = (
+                "[b][#fad166]q[/#fad166][/b] quit  "
+                "[b][#fad166]/[/#fad166][/b] search  "
+                "[b][#fad166]a[/#fad166][/b] add  "
+                "[b][#fad166]e[/#fad166][/b] edit  "
+                "[b][#fad166]d[/#fad166][/b] delete  "
+                "[b][#fad166]v[/#fad166][/b] select  "
+                "[b][#fad166]enter[/#fad166][/b] view"
+            )
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", prefix="den_edit_", delete=False
-            ) as tmp:
-                tmp.write(editor_text)
-                tmp_path = tmp.name
+            self.query_one("#footer", Static).update(text)
+        except Exception:
+            pass
 
-            subprocess.run([editor, tmp_path], check=True)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-            with open(tmp_path, "r") as f:
-                raw = f.read()
+    def on_mount(self) -> None:
+        self.query_one("#search-input").display = False
+        self.query_one("#add-input").display = False
+        self._reload_notes()
+        self.query_one("#notes-list").focus()
+        self._update_footer()
 
-        except (subprocess.CalledProcessError, OSError):
-            self.status_msg = "Editor error."
-            return
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    def watch_select_mode(self, value: bool) -> None:
+        self._update_footer()
 
-        new_content = parse_editor_content(raw)
+    def watch_add_mode(self, value: bool) -> None:
+        self._update_footer()
 
-        if new_content == n.get("content", ""):
-            self.status_msg = "No changes."
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+
+    def _reload_notes(self) -> None:
+        raw = load_notes(self.project_uid)
+        self.notes = list(reversed(raw))
+        self._update_list()
+
+    def _update_list(self) -> None:
+        notes_list = self.query_one("#notes-list", NoteListView)
+        notes_list.clear()
+        query = self.search_query.lower()
+        for idx, n in enumerate(self.notes):
+            if query in (n.get("content", "") or "").lower():
+                notes_list.append(NoteItem(n, idx))
+
+        if _get_note_items(notes_list):
+            notes_list.index = 0
+            self._update_preview()
         else:
-            note.edit(self.project_uid, display_id, new_content)
-            self.status_msg = "✓ Edited"
+            self.query_one("#bottom-preview", BottomPreview).update_preview(None)
 
-        self._reload_notes()
-        if self.search_query:
-            self._apply_search()
+    def _current_note(self) -> dict | None:
+        """Return the note dict for the currently highlighted item, or None."""
+        notes_list = self.query_one("#notes-list", NoteListView)
+        items = _get_note_items(notes_list)
+        idx = notes_list.index
+        if idx is not None and 0 <= idx < len(items):
+            return self.notes[items[idx].orig_idx]
+        return None
 
-    def _delete_selected(self):
-        sel = self._get_selected()
-        if not sel:
+    def _update_preview(self) -> None:
+        self.query_one("#bottom-preview", BottomPreview).update_preview(
+            self._current_note()
+        )
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
+    @on(ListView.Selected)
+    def on_list_selected(self, event: ListView.Selected) -> None:
+        if self.select_mode or self.add_mode:
+            return
+        n = self._current_note()
+        if n:
+            self.app.push_screen(FullScreenView(n))
+
+    @on(ListView.Highlighted)
+    def on_list_highlighted(self, event: ListView.Highlighted) -> None:
+        for item in self.query(NoteItem):
+            item.remove_class("--highlighted")
+        if event.item:
+            event.item.add_class("--highlighted")
+        self._update_preview()
+
+    @on(NoteListView.ModeChanged)
+    def on_mode_changed(self, event: NoteListView.ModeChanged) -> None:
+        self.select_mode = event.select_mode
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def action_search(self) -> None:
+        if self.select_mode or self.add_mode:
+            return
+        search_input = self.query_one("#search-input")
+        search_input.display = True
+        search_input.focus()
+
+    @on(Input.Changed, "#search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self.search_query = event.value
+        self._update_list()
+
+    @on(Input.Submitted, "#search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        self.query_one("#search-input").display = False
+        self.query_one("#notes-list").focus()
+
+    # ------------------------------------------------------------------
+    # Add
+    # ------------------------------------------------------------------
+
+    def action_enter_add_mode(self) -> None:
+        if self.select_mode or self.add_mode:
+            return
+        self.add_mode = True
+        add_input = self.query_one("#add-input")
+        add_input.display = True
+        add_input.focus()
+
+    @on(Input.Submitted, "#add-input")
+    def on_add_submitted(self, event: Input.Submitted) -> None:
+        content = event.value.strip()
+        if content:
+            note.add(self.project_uid, content)
+            self._reload_notes()
+        self.add_mode = False
+        add_input = self.query_one("#add-input")
+        add_input.value = ""
+        add_input.display = False
+        self.query_one("#notes-list").focus()
+
+    # ------------------------------------------------------------------
+    # Cancel / Escape
+    # ------------------------------------------------------------------
+
+    def action_cancel(self) -> None:
+        search_input = self.query_one("#search-input")
+        add_input = self.query_one("#add-input")
+
+        if search_input.display:
+            search_input.value = ""
+            search_input.display = False
+            self.search_query = ""
+            self._update_list()
+            self.query_one("#notes-list").focus()
+        elif add_input.display:
+            add_input.value = ""
+            add_input.display = False
+            self.add_mode = False
+            self.query_one("#notes-list").focus()
+        elif self.select_mode:
+            self.query_one("#notes-list", NoteListView).action_toggle_mode()
+
+    # ------------------------------------------------------------------
+    # Visual select
+    # ------------------------------------------------------------------
+
+    def action_toggle_mode(self) -> None:
+        if self.add_mode:
+            return
+        self.query_one("#notes-list", NoteListView).action_toggle_mode()
+
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
+
+    def action_delete_notes(self) -> None:
+        if self.add_mode:
             return
 
-        _, display_id, n = sel
-        removed = note.remove(self.project_uid, display_id)
-        if removed:
-            content = removed.get("content", "")
-            preview = content[:30] + ".." if len(content) > 30 else content
-            self.status_msg = f"✗ Deleted: {preview}"
+        notes_list = self.query_one("#notes-list", NoteListView)
+        items = _get_note_items(notes_list)
 
+        if self.select_mode:
+            to_delete = [item for item in items if item.is_selected]
+            if not to_delete:
+                return
+        else:
+            idx = notes_list.index
+            if idx is None or not items:
+                return
+            to_delete = [items[idx]]
+
+        old_index = notes_list.index or 0
+
+        for item in sorted(to_delete, key=lambda x: x.orig_idx, reverse=True):
+            note.remove(self.project_uid, item.orig_idx + 1)
+
+        if self.select_mode:
+            notes_list.select_mode = False
+            notes_list._clear_selection()
+            notes_list.selection_start_index = None
+            self.select_mode = False
+            self._update_footer()
+
+        raw = load_notes(self.project_uid)
+        self.notes = list(reversed(raw))
+        self._update_list()
+
+        new_items = _get_note_items(notes_list)
+        if new_items:
+            notes_list.index = min(old_index, len(new_items) - 1)
+            self._update_preview()
+
+    # ------------------------------------------------------------------
+    # Edit
+    # ------------------------------------------------------------------
+
+    def action_edit_note(self) -> None:
+        if self.select_mode or self.add_mode or not self.notes:
+            return
+        notes_list = self.query_one("#notes-list", NoteListView)
+        items = _get_note_items(notes_list)
+        idx = notes_list.index
+        if idx is None or not items:
+            return
+        item = items[idx]
+        n = self.notes[item.orig_idx]
+        editor = os.environ.get("EDITOR", "nano")
+        self._suspend_and_run_editor(
+            editor, format_editor_content(n), n, item.orig_idx + 1
+        )
+
+    def _suspend_and_run_editor(
+        self, editor: str, editor_text: str, n: dict, display_id: int
+    ) -> None:
+        tmp_path: str | None = None
+        with self.app.suspend():
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".txt", prefix="den_edit_", delete=False
+                ) as tmp:
+                    tmp.write(editor_text)
+                    tmp_path = tmp.name
+                subprocess.run([editor, tmp_path], check=True)
+                with open(tmp_path, "r") as f:
+                    new_content = parse_editor_content(f.read())
+                if new_content != n.get("content", ""):
+                    note.edit(self.project_uid, display_id, new_content)
+            except Exception:
+                pass
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
         self._reload_notes()
-        if self.search_query:
-            self._apply_search()
+
+    # ------------------------------------------------------------------
+    # View (Enter → full screen)
+    # ------------------------------------------------------------------
+
+    def action_view_note(self) -> None:
+        if self.select_mode or self.add_mode:
+            return
+        n = self._current_note()
+        if n:
+            self.app.push_screen(FullScreenView(n))
+
+    # ------------------------------------------------------------------
+    # Navigation delegation
+    # ------------------------------------------------------------------
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#notes-list", NoteListView).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#notes-list", NoteListView).action_cursor_up()
+
+    def action_quit_system(self) -> None:
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+
+class DenApp(App):
+    ENABLE_COMMAND_PALETTE = False
+    CSS_PATH = "tui.tcss"
+    BINDINGS = [("ctrl+q", "pass", "pass")]
+
+    def __init__(self, project_uid: str):
+        super().__init__()
+        self.project_uid = project_uid
+
+    def on_mount(self) -> None:
+        try:
+            self.theme = THEME
+        except InvalidThemeError:
+            print("Please set a valid theme in config.")
+        self.push_screen(MainScreen(self.project_uid))
 
 
 def _get_project_uid() -> str:
     try:
         proj = project.get()
-    except ValueError as e:
-        print(e)
+        return proj.get("uid")
+    except Exception:
         sys.exit(1)
-    except OSError as e:
-        print(f"Project error: {e}")
-        sys.exit(1)
-
-    uid = proj.get("uid")
-    if not uid:
-        print("Invalid project entry.")
-        sys.exit(1)
-
-    return uid
 
 
 def execute(args: argparse.Namespace) -> None:
-    """
-    Launch the interactive den TUI.
-    """
-    project_uid = _get_project_uid()
-    tui = TUI(project_uid)
-    curses.wrapper(tui.run)
+    DenApp(_get_project_uid()).run()

@@ -27,7 +27,7 @@ def _create_notes_file(project_uid: str) -> Path:
     return Path(notes_path)
 
 
-def add(project_uid: str, args: argparse.Namespace) -> None:
+def add(project_uid: str, args) -> None:
     """
     Add a note to the notes file.
     """
@@ -43,33 +43,35 @@ def add(project_uid: str, args: argparse.Namespace) -> None:
             except json.JSONDecodeError:
                 data = []
 
-            content = " ".join(args.note).strip()
+            reference = None
+            if isinstance(args, str):
+                content = args.strip()
+            else:
+                content = " ".join(args.note).strip()
+                if hasattr(args, "ref") and args.ref:
+                    try:
+                        filepath, lines = args.ref.split(":", 1)
+                        start_str, end_str = lines.split(",", 1)
+                        start_line = int(start_str)
+                        end_line = int(end_str)
+
+                        abs_filepath = Path(filepath).resolve()
+                        if abs_filepath.exists():
+                            reference = {
+                                "filepath": str(filepath),
+                                "start_line": start_line,
+                                "end_line": end_line,
+                            }
+                        else:
+                            print(
+                                f"Warning: Reference file '{abs_filepath}' does not exist."
+                            )
+                    except Exception as e:
+                        print(f"Warning: Failed to parse ref ({e})")
 
             if not content:
                 print("Empty note, skipped.")
                 return
-
-            reference = None
-            if hasattr(args, "ref") and args.ref:
-                try:
-                    filepath, lines = args.ref.split(":", 1)
-                    start_str, end_str = lines.split(",", 1)
-                    start_line = int(start_str)
-                    end_line = int(end_str)
-
-                    abs_filepath = Path(filepath).resolve()
-                    if abs_filepath.exists():
-                        reference = {
-                            "filepath": str(filepath),
-                            "start_line": start_line,
-                            "end_line": end_line,
-                        }
-                    else:
-                        print(
-                            f"Warning: Reference file '{abs_filepath}' does not exist."
-                        )
-                except Exception as e:
-                    print(f"Warning: Failed to parse ref ({e})")
 
             note = {
                 "created_at": str(datetime.datetime.now()),
