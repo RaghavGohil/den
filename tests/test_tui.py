@@ -13,7 +13,7 @@ def mock_notes():
 
 @pytest.mark.asyncio
 async def test_app_mount(mock_notes):
-    with patch("den.parser.den.load_notes", return_value=mock_notes), \
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
          patch("den.parser.den.get_reference", return_value=None):
         app = DenApp("test_project")
         async with app.run_test() as pilot:
@@ -26,7 +26,7 @@ async def test_app_mount(mock_notes):
 
 @pytest.mark.asyncio
 async def test_search(mock_notes):
-    with patch("den.parser.den.load_notes", return_value=mock_notes), \
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
          patch("den.parser.den.get_reference", return_value=None):
         app = DenApp("test_project")
         async with app.run_test() as pilot:
@@ -51,9 +51,9 @@ async def test_search(mock_notes):
 
 @pytest.mark.asyncio
 async def test_vim_select_mode_and_delete(mock_notes):
-    with patch("den.parser.den.load_notes", return_value=mock_notes), \
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
          patch("den.parser.den.get_reference", return_value=None), \
-         patch("den.parser.note.remove", return_value={"content": "removed"}) as mock_remove:
+         patch("den.parser.den.backend.remove_note", return_value={"content": "removed"}) as mock_remove:
         
         app = DenApp("test_project")
         async with app.run_test() as pilot:
@@ -77,20 +77,42 @@ async def test_vim_select_mode_and_delete(mock_notes):
             # Delete selected
             await pilot.press("d")
             
-            # note.remove should have been called twice
+            # backend.remove_note should have been called twice
             assert mock_remove.call_count == 2
             assert screen.select_mode is False
 
 @pytest.mark.asyncio
+async def test_search_no_selection_on_refocus(mock_notes):
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
+         patch("den.parser.den.get_reference", return_value=None):
+        app = DenApp("test_project")
+        async with app.run_test() as pilot:
+            # First search
+            await pilot.press("/")
+            for char in "Note":
+                await pilot.press(char)
+            await pilot.press("enter")
+            
+            # Refocus search
+            await pilot.press("/")
+            screen = app.screen
+            search_input = screen.query_one("#search-input", Input)
+            
+            # Check selection is at the end and no text is selected
+            assert search_input.cursor_position == len("Note")
+            assert search_input.selection_start == len("Note")
+            assert search_input.selection_end == len("Note")
+
+@pytest.mark.asyncio
 async def test_add_mode(mock_notes):
-    with patch("den.parser.den.load_notes", return_value=mock_notes), \
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
          patch("den.parser.den.get_reference", return_value=None), \
-         patch("den.parser.note.add", return_value={"content": "new note"}) as mock_add:
+         patch("den.parser.den.backend.add_note", return_value={"content": "new note"}) as mock_add:
         
         app = DenApp("test_project")
         async with app.run_test() as pilot:
-            # Press 'A' to add (Shift+a)
-            await pilot.press("A")
+            # Press 'a' to add
+            await pilot.press("a")
             screen = app.screen
             add_input = screen.query_one("#add-input", Input)
             assert add_input.display is True
@@ -111,7 +133,7 @@ async def test_add_mode(mock_notes):
 
 @pytest.mark.asyncio
 async def test_view_mode(mock_notes):
-    with patch("den.parser.den.load_notes", return_value=mock_notes), \
+    with patch("den.parser.den.backend.load_notes", return_value=mock_notes), \
          patch("den.parser.den.get_reference", return_value=None):
         
         app = DenApp("test_project")

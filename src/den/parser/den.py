@@ -3,25 +3,26 @@ Interactive TUI for den using textual.
 Supports Operate, Search, Visual, View, and Add modes.
 """
 
-import argparse
 import os
 import sys
 import tempfile
 import subprocess
+import argparse
+from enum import Enum, auto
 
+from textual import on
+from textual.screen import Screen
+from textual.message import Message
+from textual.binding import Binding
+from textual.reactive import reactive
 from textual.app import App, ComposeResult, InvalidThemeError
 from textual.widgets import ListView, ListItem, Static, Input, Label
 from textual.containers import Horizontal, Vertical, ScrollableContainer
-from textual.binding import Binding
-from textual.screen import Screen
-from textual import on
-from textual.message import Message
-from textual.reactive import reactive
 
-from ..config import THEME
-from . import note, project
+from ..config import config
+from .project import get_current_project_uid
+from .note import backend
 from ..parser.notes_helper import (
-    load_notes,
     get_reference,
     read_reference_code,
     _format_timestamp,
@@ -30,19 +31,37 @@ from ..parser.notes_helper import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _get_note_items(notes_list: "NoteListView") -> list["NoteItem"]:
     """Return a plain list of NoteItem children — safe to index."""
     return [c for c in notes_list.children if isinstance(c, NoteItem)]
 
 
-# ---------------------------------------------------------------------------
-# Widgets
-# ---------------------------------------------------------------------------
+class Mode(Enum):
+    OPERATE = auto()
+    VIEW = auto()
+    SEARCH = auto()
+    ADD = auto()
+    DELETE = auto()
+
+
+current_mode = Mode.OPERATE
+current_project = get_current_project_uid()
+
+
+class DenApp(App):
+    ENABLE_COMMAND_PALETTE = False
+    CSS_PATH = "tui.tcss"
+    BINDINGS = [("ctrl+q", "pass", "pass")]
+
+    def __init__(self):
+        super().__init__()
+
+    def on_mount(self) -> None:
+        try:
+            self.theme = config.THEME
+        except InvalidThemeError:
+            print("Please set a valid theme in config.")
+        self.push_screen(MainScreen())
 
 
 class NoteItem(ListItem):
@@ -180,24 +199,29 @@ class FullScreenView(Screen):
 
         with Vertical(id="view-container"):
             with ScrollableContainer(id="view-scroll-area"):
-                yield Label(
-                    f"[overline][b] NOTE [/b][/overline]\n\n{content}",
+                yield Vertical(
+                    Label("[b]NOTE[/b]\n\n", id="text-accent"),
+                    Label(f"{content}", id="text-muted"),
                     id="view-header",
                 )
+                yield Label()
                 if ref:
                     filepath = ref.get("filepath", "")
                     start = ref.get("start_line", "")
                     end = ref.get("end_line", "")
                     code = read_reference_code(ref)
-                    context_text = (
-                        f"[overline][b] REFERENCE [/b][/overline] "
-                        f"[dim]{filepath}:{start}-{end}[/dim]\n\n{code}"
-                    )
+                    context_text = f"[dim]{filepath}:{start}-{end}[/dim]\n\n{code}"
                 else:
-                    context_text = "\n[dim]No reference attached to this note.[/dim]"
-                yield Label(context_text, id="view-context")
-            yield Static(
-                "[b][#fad166]q[/#fad166][/b] back",
+                    context_text = "No reference attached to this note."
+                yield Vertical(
+                    Label("[b]REFERENCE[/b]\n\n", id="text-accent"),
+                    Label(f"{context_text}", id="text-muted"),
+                    id="view-context",
+                )
+
+            yield Horizontal(
+                Label("[b]q[/b] ", id="text-accent"),
+                Label("back", id="text-muted"),
                 id="footer",
             )
 
@@ -218,6 +242,7 @@ class MainScreen(Screen):
 
     select_mode = reactive(False)
     add_mode = reactive(False)
+    search_active = reactive(False)
 
     BINDINGS = [
         Binding("q", "quit_system", "quit"),
@@ -232,9 +257,8 @@ class MainScreen(Screen):
         Binding("escape", "cancel", "cancel", show=False),
     ]
 
-    def __init__(self, project_uid: str):
+    def __init__(self):
         super().__init__()
-        self.project_uid = project_uid
         self.notes: list[dict] = []
         self.search_query = ""
 
@@ -244,68 +268,97 @@ class MainScreen(Screen):
             yield BottomPreview(id="bottom-preview")
         yield Input(placeholder="Search...", id="search-input")
         yield Input(placeholder="Add note...", id="add-input")
-        yield Static("", id="footer")
+        yield Horizontal(Label(), id="footer")
 
     # ------------------------------------------------------------------
     # Footer
     # ------------------------------------------------------------------
 
-    def _update_footer(self) -> None:
+    async def _update_footer(self) -> None:
+        cues: list[tuple[str, str]] = []  # format cue, desc
         if self.add_mode:
-            text = "[b][#fad166]esc[/#fad166][/b] cancel  [b][#fad166]enter[/#fad166][/b] add"
+            cues.extend([("esc", "cancel"), ("enter", "add")])
         elif self.select_mode:
-            text = "[b][#fad166]esc[/#fad166][/b] deselect  [b][#fad166]d[/#fad166][/b] delete"
-        else:
-            text = (
-                "[b][#fad166]q[/#fad166][/b] quit  "
-                "[b][#fad166]/[/#fad166][/b] search  "
-                "[b][#fad166]a[/#fad166][/b] add  "
-                "[b][#fad166]e[/#fad166][/b] edit  "
-                "[b][#fad166]d[/#fad166][/b] delete  "
-                "[b][#fad166]v[/#fad166][/b] select  "
-                "[b][#fad166]enter[/#fad166][/b] view"
+            cues.extend([("q", "quit"), ("v", "deselect"), ("d", "delete")])
+        elif self.search_active:
+            cues.extend(
+                [
+                    ("q", "back"),
+                    ("/", "search"),
+                    ("a", "add"),
+                    ("e", "edit"),
+                    ("d", "delete"),
+                    ("v", "select"),
+                    ("enter", "view"),
+                ]
             )
-        try:
-            self.query_one("#footer", Static).update(text)
-        except Exception:
-            pass
+        else:
+            cues.extend(
+                [
+                    ("q", "quit"),
+                    ("/", "search"),
+                    ("a", "add"),
+                    ("e", "edit"),
+                    ("d", "delete"),
+                    ("v", "select"),
+                    ("enter", "view"),
+                ]
+            )
+        cue_horizontals: list[Horizontal] = []
+        for cue, desc in cues:
+            cue_horizontals.append(
+                Horizontal(
+                    Label(f"[b]{cue}[/b] ", id="text-accent"),
+                    Label(f"{desc} ", id="text-muted"),
+                )
+            )
+
+        print(cues)
+        footer = self.query_one("#footer", Horizontal)
+        await footer.remove_children()
+        await footer.mount_all(cue_horizontals)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.query_one("#search-input").display = False
         self.query_one("#add-input").display = False
         self._reload_notes()
         self.query_one("#notes-list").focus()
-        self._update_footer()
+        await self._update_footer()
 
-    def watch_select_mode(self, value: bool) -> None:
-        self._update_footer()
+    async def watch_select_mode(self, _: bool) -> None:
+        await self._update_footer()
 
-    def watch_add_mode(self, value: bool) -> None:
-        self._update_footer()
+    async def watch_add_mode(self, _: bool) -> None:
+        await self._update_footer()
+
+    async def watch_search_active(self, _: bool) -> None:
+        await self._update_footer()
 
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
 
-    def _reload_notes(self) -> None:
-        raw = load_notes(self.project_uid)
+    def _reload_notes(self, index: int | None = None) -> None:
+        raw = backend.load_notes()
         self.notes = list(reversed(raw))
-        self._update_list()
+        self._update_list(index=index)
 
-    def _update_list(self) -> None:
+    def _update_list(self, index: int | None = None) -> None:
         notes_list = self.query_one("#notes-list", NoteListView)
         notes_list.clear()
         query = self.search_query.lower()
+        items_added = 0
         for idx, n in enumerate(self.notes):
             if query in (n.get("content", "") or "").lower():
                 notes_list.append(NoteItem(n, idx))
+                items_added += 1
 
-        if _get_note_items(notes_list):
-            notes_list.index = 0
+        if items_added > 0:
+            notes_list.index = min(index if index is not None else 0, items_added - 1)
             self._update_preview()
         else:
             self.query_one("#bottom-preview", BottomPreview).update_preview(None)
@@ -316,7 +369,9 @@ class MainScreen(Screen):
         items = _get_note_items(notes_list)
         idx = notes_list.index
         if idx is not None and 0 <= idx < len(items):
-            return self.notes[items[idx].orig_idx]
+            item = items[idx]
+            if 0 <= item.orig_idx < len(self.notes):
+                return self.notes[item.orig_idx]
         return None
 
     def _update_preview(self) -> None:
@@ -328,7 +383,7 @@ class MainScreen(Screen):
     # Events
     # ------------------------------------------------------------------
     @on(ListView.Selected)
-    def on_list_selected(self, event: ListView.Selected) -> None:
+    def on_list_selected(self, _: ListView.Selected) -> None:
         if self.select_mode or self.add_mode:
             return
         n = self._current_note()
@@ -354,7 +409,7 @@ class MainScreen(Screen):
     def action_search(self) -> None:
         if self.select_mode or self.add_mode:
             return
-        search_input = self.query_one("#search-input")
+        search_input = self.query_one("#search-input", Input)
         search_input.display = True
         search_input.focus()
 
@@ -362,10 +417,19 @@ class MainScreen(Screen):
     def on_search_changed(self, event: Input.Changed) -> None:
         self.search_query = event.value
         self._update_list()
+        # If user is typing, we might want to show the search status even before enter
+        if self.search_query:
+            self.search_active = True
+        else:
+            self.search_active = False
 
     @on(Input.Submitted, "#search-input")
-    def on_search_submitted(self, event: Input.Submitted) -> None:
-        self.query_one("#search-input").display = False
+    def on_search_submitted(self, _: Input.Submitted) -> None:
+        if not self.search_query:
+            self.query_one("#search-input").display = False
+            self.search_active = False
+        else:
+            self.search_active = True
         self.query_one("#notes-list").focus()
 
     # ------------------------------------------------------------------
@@ -376,7 +440,7 @@ class MainScreen(Screen):
         if self.select_mode or self.add_mode:
             return
         self.add_mode = True
-        add_input = self.query_one("#add-input")
+        add_input = self.query_one("#add-input", Input)
         add_input.display = True
         add_input.focus()
 
@@ -384,11 +448,10 @@ class MainScreen(Screen):
     def on_add_submitted(self, event: Input.Submitted) -> None:
         content = event.value.strip()
         if content:
-            note.add(self.project_uid, content)
-            self._reload_notes()
+            backend.add_note(content)
+            self._reload_notes(index=0)
         self.add_mode = False
         add_input = self.query_one("#add-input")
-        add_input.value = ""
         add_input.display = False
         self.query_one("#notes-list").focus()
 
@@ -401,16 +464,19 @@ class MainScreen(Screen):
         add_input = self.query_one("#add-input")
 
         if search_input.display:
-            search_input.value = ""
             search_input.display = False
             self.search_query = ""
+            self.search_active = False
             self._update_list()
             self.query_one("#notes-list").focus()
         elif add_input.display:
-            add_input.value = ""
             add_input.display = False
             self.add_mode = False
             self.query_one("#notes-list").focus()
+        elif self.search_active:
+            self.search_query = ""
+            self.search_active = False
+            self._reload_notes()
         elif self.select_mode:
             self.query_one("#notes-list", NoteListView).action_toggle_mode()
 
@@ -427,7 +493,7 @@ class MainScreen(Screen):
     # Delete
     # ------------------------------------------------------------------
 
-    def action_delete_notes(self) -> None:
+    async def action_delete_notes(self) -> None:
         if self.add_mode:
             return
 
@@ -447,23 +513,17 @@ class MainScreen(Screen):
         old_index = notes_list.index or 0
 
         for item in sorted(to_delete, key=lambda x: x.orig_idx, reverse=True):
-            note.remove(self.project_uid, item.orig_idx + 1)
+            note_data = self.notes[item.orig_idx]
+            backend.remove_note(note_data.get("id"))
 
         if self.select_mode:
             notes_list.select_mode = False
             notes_list._clear_selection()
             notes_list.selection_start_index = None
             self.select_mode = False
-            self._update_footer()
+            await self._update_footer()
 
-        raw = load_notes(self.project_uid)
-        self.notes = list(reversed(raw))
-        self._update_list()
-
-        new_items = _get_note_items(notes_list)
-        if new_items:
-            notes_list.index = min(old_index, len(new_items) - 1)
-            self._update_preview()
+        self._reload_notes(index=old_index)
 
     # ------------------------------------------------------------------
     # Edit
@@ -472,20 +532,25 @@ class MainScreen(Screen):
     def action_edit_note(self) -> None:
         if self.select_mode or self.add_mode or not self.notes:
             return
+        n = self._current_note()
+        if not n:
+            raise TypeError("Current note is None!")
+
+        # We need the display_id (orig_idx + 1) for the editor
+        # Find the item again to be sure
         notes_list = self.query_one("#notes-list", NoteListView)
         items = _get_note_items(notes_list)
         idx = notes_list.index
-        if idx is None or not items:
+        if idx is None or not (0 <= idx < len(items)):
             return
-        item = items[idx]
-        n = self.notes[item.orig_idx]
+
         editor = os.environ.get("EDITOR", "nano")
         self._suspend_and_run_editor(
-            editor, format_editor_content(n), n, item.orig_idx + 1
+            editor, format_editor_content(n), n, n.get("id"), idx
         )
 
     def _suspend_and_run_editor(
-        self, editor: str, editor_text: str, n: dict, display_id: int
+        self, editor: str, editor_text: str, n: dict, note_id: str, current_idx: int
     ) -> None:
         tmp_path: str | None = None
         with self.app.suspend():
@@ -499,7 +564,7 @@ class MainScreen(Screen):
                 with open(tmp_path, "r") as f:
                     new_content = parse_editor_content(f.read())
                 if new_content != n.get("content", ""):
-                    note.edit(self.project_uid, display_id, new_content)
+                    backend.edit_note(note_id, new_content)
             except Exception:
                 pass
             finally:
@@ -508,7 +573,7 @@ class MainScreen(Screen):
                         os.unlink(tmp_path)
                     except Exception:
                         pass
-        self._reload_notes()
+        self._reload_notes(index=current_idx)
 
     # ------------------------------------------------------------------
     # View (Enter → full screen)
@@ -532,38 +597,15 @@ class MainScreen(Screen):
         self.query_one("#notes-list", NoteListView).action_cursor_up()
 
     def action_quit_system(self) -> None:
+        if self.search_active:
+            self.search_query = ""
+            self.search_active = False
+            search_input = self.query_one("#search-input")
+            search_input.display = False
+            self._reload_notes()
+            return
         sys.exit(0)
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
-
-class DenApp(App):
-    ENABLE_COMMAND_PALETTE = False
-    CSS_PATH = "tui.tcss"
-    BINDINGS = [("ctrl+q", "pass", "pass")]
-
-    def __init__(self, project_uid: str):
-        super().__init__()
-        self.project_uid = project_uid
-
-    def on_mount(self) -> None:
-        try:
-            self.theme = THEME
-        except InvalidThemeError:
-            print("Please set a valid theme in config.")
-        self.push_screen(MainScreen(self.project_uid))
-
-
-def _get_project_uid() -> str:
-    try:
-        proj = project.get()
-        return proj.get("uid")
-    except Exception:
-        sys.exit(1)
-
-
-def execute(args: argparse.Namespace) -> None:
-    DenApp(_get_project_uid()).run()
+def execute(_: argparse.Namespace) -> None:
+    DenApp().run()

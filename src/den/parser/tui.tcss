@@ -99,9 +99,13 @@ NoteListView > NoteItem.--highlighted {
 #footer {
     dock: bottom;
     background: $surface-darken-2;
-    color: $text-muted;
     padding: 0 2;
     height: 1;
+    width:100%;
+}
+
+#footer > * {
+    width: auto;
 }
 
 /* ─── Full-Screen View ──────────────────────────────────────────── */
@@ -123,7 +127,6 @@ NoteListView > NoteItem.--highlighted {
     padding: 1 2;
     width: 100%;
     height: auto;
-    margin-bottom: 1;
 }
 
 #view-context {
@@ -131,4 +134,12 @@ NoteListView > NoteItem.--highlighted {
     color: $text;
     height: auto;
     width: 100%;
+}
+
+#text-accent {
+    color: $accent;
+}
+
+#text-muted {
+    color: $text-muted;
 }

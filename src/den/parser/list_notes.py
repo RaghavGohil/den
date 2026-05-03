@@ -1,30 +1,15 @@
 import argparse
 import shutil
 from ..utils import colors
-from ..parser.project import get as get_project
-from ..parser.notes_helper import load_notes, format_note_line, format_note_context
+from ..parser.note import backend
+from ..parser.notes_helper import format_note_line, format_note_context
 
 
 def execute(_args: argparse.Namespace) -> None:
     """
     List all notes for the current project.
     """
-    try:
-        project = get_project()
-    except ValueError as e:
-        print(e)
-        return
-    except OSError as e:
-        print(f"Project error: {e}")
-        return
-
-    project_uid = project.get("uid")
-
-    if not project_uid:
-        print("Invalid project entry.")
-        return
-
-    notes = load_notes(project_uid)
+    notes = backend.load_notes()
 
     if not notes:
         print(colors.dim("  No notes yet."))

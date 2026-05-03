@@ -34,10 +34,10 @@ _parser_add.set_defaults(func=add_note.execute)
 _parser_add.add_argument("note", nargs="*")
 _parser_edit = _subparsers.add_parser(name="edit")
 _parser_edit.set_defaults(func=edit_note.execute)
-_parser_edit.add_argument("id", type=str, nargs="?", default=1)
+_parser_edit.add_argument("id", type=str, nargs="?", default=None)
 _parser_rm = _subparsers.add_parser(name="rm")
 _parser_rm.set_defaults(func=remove_note.execute)
-_parser_rm.add_argument("id", type=str, nargs="?", default=1)
+_parser_rm.add_argument("id", type=str, nargs="?", default=None)
 
 
 def execute() -> None:

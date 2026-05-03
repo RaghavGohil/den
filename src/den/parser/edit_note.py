@@ -4,41 +4,27 @@ import subprocess
 import argparse
 
 from ..utils import colors
-from . import note, project
+from .note import backend
 from . import notes_helper
 
 
 def execute(args: argparse.Namespace) -> None:
     """
-    Edit a note by its display index using $EDITOR.
+    Edit a note by its display index or hash ID using $EDITOR.
     """
-    try:
-        proj = project.get()
-    except ValueError as e:
-        print(e)
-        return
-    except OSError as e:
-        print(f"Project error: {e}")
-        return
-
-    project_uid = proj.get("uid")
-
-    if not project_uid:
-        print("Invalid project entry.")
-        return
-
-    notes = notes_helper.load_notes(project_uid)
+    notes = backend.load_notes()
 
     if not notes:
         print("No notes to edit.")
         return
 
-    display_id = args.id
-    total = len(notes)
-    idx = total - display_id
+    idx = backend.find_note_index(args.id)
 
-    if idx < 0 or idx >= total:
-        print(f"Invalid note ID. Use a number between 1 and {total}.")
+    if idx == -1:
+        if args.id:
+            print(f"Could not find note with ID: {args.id}")
+        else:
+            print("No notes to edit.")
         return
 
     n = notes[idx]
@@ -75,7 +61,7 @@ def execute(args: argparse.Namespace) -> None:
         print(colors.dim("No changes made."))
         return
 
-    updated = note.edit(project_uid, display_id, new_content)
+    updated = backend.edit_note(args.id, new_content)
 
     if updated:
         print(
